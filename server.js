@@ -1,0 +1,79 @@
+const express=require("express"),path=require("path"),fs=require("fs"),bcrypt=require("bcryptjs"),{v4:uuid}=require("uuid");
+const app=express(),PORT=process.env.PORT||3000,HOST="0.0.0.0",DIR=path.join(__dirname,"data"),UF=path.join(DIR,"users.json"),RF=path.join(DIR,"resources.json"),QF=path.join(DIR,"requests.json"),DF=path.join(DIR,"disputes.json");
+if(!fs.existsSync(DIR))fs.mkdirSync(DIR,{recursive:true}); for(const f of [UF,RF,QF,DF])if(!fs.existsSync(f))fs.writeFileSync(f,"[]");
+app.use(express.json());
+const read=f=>{try{return JSON.parse(fs.readFileSync(f,"utf8"))}catch{return[]}},write=(f,x)=>fs.writeFileSync(f,JSON.stringify(x,null,2));
+const sessions=new Map(),safe=u=>{const{passwordHash,...x}=u;return x};
+const cookieToken=req=>{const raw=req.headers.cookie||"";const m=raw.match(/(?:^|;\s*)cs_session=([^;]+)/);return m?decodeURIComponent(m[1]):null};
+function auth(req,res,next){const t=req.headers.authorization?.replace("Bearer ","")||cookieToken(req),id=sessions.get(t),u=read(UF).find(x=>x.id===id);if(!u)return res.status(401).json({error:"Please login first."});req.user=u;req.token=t;next()}
+// Protect HTML pages on the server as well as in the browser. Public entry pages and static assets remain available.
+app.use((req,res,next)=>{if(req.path.endsWith(".html")&&! ["/login.html","/register.html"].includes(req.path)){const t=cookieToken(req);if(!t||!sessions.has(t)){return res.redirect(302,"/login.html");}}next()});
+app.use(express.static(path.join(__dirname,"public"),{index:false}));
+app.get("/",(q,s)=>{const t=cookieToken(q);s.redirect(302,t&&sessions.has(t)?"/index.html":"/login.html")});
+app.get("/api/health",(q,s)=>s.json({ok:true,app:"CampusShare",database:"JSON"}));
+app.post("/api/register",async(req,res)=>{try{let{fullName,rollNo,email,phone,department,year,password}=req.body;if(!fullName||!rollNo||!email||!phone||!department||!year||!password)return res.status(400).json({error:"All fields are required."});if(password.length<6)return res.status(400).json({error:"Password must contain at least 6 characters."});let a=read(UF),e=email.trim().toLowerCase(),r=rollNo.trim().toLowerCase();if(a.some(x=>x.email===e))return res.status(409).json({error:"Email is already registered."});if(a.some(x=>x.rollNo.toLowerCase()===r))return res.status(409).json({error:"Roll number is already registered."});let u={id:uuid(),fullName:fullName.trim(),rollNo:rollNo.trim(),email:e,phone:phone.trim(),department:department.trim(),year:year.trim(),passwordHash:await bcrypt.hash(password,10),createdAt:new Date().toISOString()};a.push(u);write(UF,a);let t=uuid();sessions.set(t,u.id);res.setHeader("Set-Cookie",`cs_session=${encodeURIComponent(t)}; HttpOnly; SameSite=Lax; Path=/`);res.status(201).json({message:"Registration successful.",token:t,user:safe(u)})}catch(e){res.status(500).json({error:"Registration failed."})}});
+app.post("/api/login",async(req,res)=>{try{let{email,password}=req.body,u=read(UF).find(x=>x.email===email?.trim().toLowerCase());if(!u||!(await bcrypt.compare(password||"",u.passwordHash)))return res.status(401).json({error:"Invalid email or password."});let t=uuid();sessions.set(t,u.id);res.setHeader("Set-Cookie",`cs_session=${encodeURIComponent(t)}; HttpOnly; SameSite=Lax; Path=/`);res.json({message:"Login successful.",token:t,user:safe(u)})}catch(e){res.status(500).json({error:"Login failed."})}});
+app.post("/api/logout",auth,(q,s)=>{sessions.delete(q.token);s.setHeader("Set-Cookie","cs_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");s.json({message:"Logged out."})});
+app.get("/api/me",auth,(q,s)=>s.json({user:safe(q.user)}));
+// Public student profile and reputation, calculated from submitted lender reviews.
+app.get("/api/users/:id/profile",(q,s)=>{
+  const u=read(UF).find(x=>x.id===q.params.id);
+  if(!u)return s.status(404).json({error:"Student profile not found."});
+  const requests=read(QF);
+  const relevant=requests.filter(x=>x.requesterId===u.id||x.ownerId===u.id);
+  const reviews=requests
+    .filter(x=>x.requesterId===u.id&&["good","poor"].includes(x.rating))
+    .sort((a,b)=>new Date(b.ratedAt||b.updatedAt||b.createdAt)-new Date(a.ratedAt||a.updatedAt||a.createdAt));
+  const good=reviews.filter(x=>x.rating==="good").length;
+  const poor=reviews.filter(x=>x.rating==="poor").length;
+  const borrowerTransactions=requests.filter(x=>x.requesterId===u.id&&["accepted","completed"].includes(x.status));
+  const lenderTransactions=requests.filter(x=>x.ownerId===u.id&&["accepted","completed"].includes(x.status));
+  const stats={
+    timesBorrowed:borrowerTransactions.length,
+    itemsReturned:borrowerTransactions.filter(x=>x.status==="completed"||x.returnedAt).length,
+    timesLent:lenderTransactions.length,
+    itemsReturnedToMe:lenderTransactions.filter(x=>x.status==="completed"||x.returnedAt).length,
+    overdueLoans:requests.filter(x=>x.requesterId===u.id&&x.status==="accepted"&&x.neededUntil&&new Date(x.neededUntil+"T23:59:59")<new Date()).length
+  };
+  const history=relevant
+    .filter(x=>["accepted","completed"].includes(x.status)||["good","poor"].includes(x.rating))
+    .map(x=>{
+      const isBorrower=x.requesterId===u.id;
+      return {
+        id:x.id, role:isBorrower?"borrowed":"lent",
+        resourceTitle:x.resourceTitle||"Campus resource",
+        otherStudentId:isBorrower?x.ownerId:x.requesterId,
+        otherStudentName:isBorrower?(x.ownerName||"CampusShare student"):(x.requesterName||"CampusShare student"),
+        status:x.status, acceptedAt:x.acceptedAt||x.updatedAt||x.createdAt,
+        createdAt:x.createdAt, dueDate:x.neededUntil||null, isOverdue:x.status==="accepted"&&!!x.neededUntil&&new Date(x.neededUntil+"T23:59:59")<new Date(), returnedAt:x.returnedAt||null,
+        rating:x.rating||null, review:x.review||""
+      };
+    })
+    .sort((a,b)=>new Date(b.returnedAt||b.acceptedAt||b.createdAt)-new Date(a.returnedAt||a.acceptedAt||a.createdAt));
+  const safeReviews=reviews.map(x=>({
+    rating:x.rating,review:x.review||"",resourceTitle:x.resourceTitle||"Borrowed resource",
+    ratedAt:x.ratedAt||x.updatedAt||x.createdAt,lenderName:x.ownerName||"CampusShare student"
+  }));
+  s.json({
+    profile:{id:u.id,fullName:u.fullName,rollNo:u.rollNo,department:u.department,year:u.year,createdAt:u.createdAt},
+    stats,reputation:{total:reviews.length,good,poor,score:reviews.length?Math.round(good/reviews.length*100):null},
+    reviews:safeReviews,history
+  });
+});
+app.get("/api/resources",(q,s)=>{let a=read(RF).sort((x,y)=>new Date(y.createdAt)-new Date(x.createdAt));s.json({resources:a})});
+app.get("/api/resources/:id",(q,s)=>{let r=read(RF).find(x=>x.id===q.params.id);r?s.json({resource:r}):s.status(404).json({error:"Resource not found."})});
+app.post("/api/resources",auth,(q,s)=>{let{title,category,listingType,condition,price,description,location,contactPhone,contactEmail,showContact}=q.body;if(!title||!category||!listingType||!condition||!description||!location)return s.status(400).json({error:"Please fill all required fields."});let a=read(RF),dup=a.find(x=>x.ownerId===q.user.id&&x.title.toLowerCase()===title.trim().toLowerCase()&&x.location.toLowerCase()===location.trim().toLowerCase());if(dup)return s.status(409).json({error:"You already listed the same resource at this location."});let r={id:uuid(),ownerId:q.user.id,ownerName:q.user.fullName,title:title.trim(),category,listingType,condition,price:Number(price||0),description:description.trim(),location:location.trim(),contactPhone:(contactPhone||q.user.phone).trim(),contactEmail:(contactEmail||q.user.email).trim(),showContact:showContact!==false,status:"available",createdAt:new Date().toISOString()};a.push(r);write(RF,a);s.status(201).json({message:"Resource added successfully.",resource:r})});
+app.get("/api/my-resources",auth,(q,s)=>s.json({resources:read(RF).filter(x=>x.ownerId===q.user.id)}));
+// Resource requests: students can request a listed lending item; only the owner can accept/decline.
+app.post("/api/requests",auth,(q,s)=>{try{let{resourceId,message,neededUntil}=q.body||{},resources=read(RF),r=resources.find(x=>x.id===resourceId);if(!r)return s.status(404).json({error:"Resource not found."});if(r.ownerId===q.user.id)return s.status(400).json({error:"You cannot request your own resource."});if(r.listingType!=="lend")return s.status(400).json({error:"Requests are for lending resources. Contact the seller for items for sale."});if(r.status!=="available")return s.status(400).json({error:"This resource is not currently available."});let a=read(QF);if(a.some(x=>x.resourceId===r.id&&x.requesterId===q.user.id&&["pending","accepted"].includes(x.status)))return s.status(409).json({error:"You already have an active request for this resource."});let item={id:uuid(),resourceId:r.id,resourceTitle:r.title,ownerId:r.ownerId,ownerName:r.ownerName,requesterId:q.user.id,requesterName:q.user.fullName,requesterEmail:q.user.email,requesterPhone:q.user.phone,message:String(message||"").trim(),neededUntil:String(neededUntil||"").trim(),status:"pending",createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};a.push(item);write(QF,a);s.status(201).json({message:"Request sent to the resource owner.",request:item})}catch(e){s.status(500).json({error:"Could not send request."})}});
+app.get("/api/requests",auth,(q,s)=>{let resources=read(RF),disputes=read(DF),a=read(QF).filter(x=>x.ownerId===q.user.id||x.requesterId===q.user.id).sort((x,y)=>new Date(y.createdAt)-new Date(x.createdAt));s.json({requests:a.map(x=>{const resource=resources.find(z=>z.id===x.resourceId)||{};const visible=["accepted","completed"].includes(x.status);const dispute=disputes.find(d=>d.requestId===x.id);const isOverdue=x.status==="accepted"&&!!x.neededUntil&&new Date(x.neededUntil+"T23:59:59")<new Date();return {...x,isOverdue,dispute:dispute?{id:dispute.id,reportedBy:dispute.reportedByName,reason:dispute.reason,status:dispute.status,createdAt:dispute.createdAt}:null,role:x.ownerId===q.user.id?"received":"sent",contact:visible?{name:x.ownerId===q.user.id?x.requesterName:x.ownerName,phone:x.ownerId===q.user.id?x.requesterPhone:resource.contactPhone,email:x.ownerId===q.user.id?x.requesterEmail:resource.contactEmail}:null}})})});
+app.patch("/api/requests/:id/status",auth,(q,s)=>{let a=read(QF),r=a.find(x=>x.id===q.params.id);if(!r)return s.status(404).json({error:"Request not found."});if(r.ownerId!==q.user.id)return s.status(403).json({error:"Only the resource owner can respond to this request."});if(!["accepted","declined"].includes(q.body.status))return s.status(400).json({error:"Choose accepted or declined."});if(r.status!=="pending")return s.status(409).json({error:"This request has already been answered."});r.status=q.body.status;r.updatedAt=new Date().toISOString();if(r.status==="accepted")r.acceptedAt=r.updatedAt;write(QF,a);if(r.status==="accepted"){let resources=read(RF),resource=resources.find(x=>x.id===r.resourceId);if(resource){resource.status="unavailable";write(RF,resources);for(const other of a){if(other.id!==r.id&&other.resourceId===r.resourceId&&other.status==="pending"){other.status="declined";other.updatedAt=new Date().toISOString()}}write(QF,a)}}s.json({message:`Request ${r.status}.`,request:r})});
+app.patch("/api/requests/:id/complete",auth,(q,s)=>{let a=read(QF),r=a.find(x=>x.id===q.params.id);if(!r)return s.status(404).json({error:"Request not found."});if(r.ownerId!==q.user.id)return s.status(403).json({error:"Only the lender can confirm return."});if(r.status!=="accepted")return s.status(409).json({error:"Only accepted requests can be completed."});r.status="completed";r.returnedAt=new Date().toISOString();r.updatedAt=r.returnedAt;write(QF,a);let resources=read(RF),resource=resources.find(x=>x.id===r.resourceId);if(resource){resource.status="available";write(RF,resources)}s.json({message:"Return marked complete. You can now rate the borrower.",request:r})});
+app.post("/api/requests/:id/review",auth,(q,s)=>{let a=read(QF),r=a.find(x=>x.id===q.params.id);if(!r)return s.status(404).json({error:"Request not found."});if(r.ownerId!==q.user.id)return s.status(403).json({error:"Only the lender can rate the borrower."});if(!["accepted","completed"].includes(r.status))return s.status(409).json({error:"Only accepted requests can be reviewed."});if(r.rating)return s.status(409).json({error:"This borrower has already been rated for this request."});const rating=q.body?.rating;if(!["good","poor"].includes(rating))return s.status(400).json({error:"Choose good or poor."});r.rating=rating;r.review=String(q.body?.review||"").trim().slice(0,500);r.ratedAt=new Date().toISOString();r.updatedAt=r.ratedAt;if(rating==="good"){r.status="completed";r.returnedAt=r.returnedAt||r.ratedAt;let resources=read(RF),resource=resources.find(x=>x.id===r.resourceId);if(resource){resource.status="available";write(RF,resources)}}write(QF,a);s.json({message:rating==="good"?"Positive rating saved. Thanks for confirming a good return.":"Poor rating saved and attached to this borrowing record.",request:r})});
+app.post("/api/requests/:id/cancel",auth,(q,s)=>{let a=read(QF),r=a.find(x=>x.id===q.params.id);if(!r)return s.status(404).json({error:"Request not found."});if(r.requesterId!==q.user.id)return s.status(403).json({error:"Only the requester can cancel this request."});if(r.status!=="pending")return s.status(409).json({error:"Only pending requests can be cancelled."});r.status="cancelled";r.updatedAt=new Date().toISOString();write(QF,a);s.json({message:"Request cancelled."})});
+app.post("/api/requests/:id/dispute",auth,(q,s)=>{const requests=read(QF),r=requests.find(x=>x.id===q.params.id);if(!r)return s.status(404).json({error:"Request not found."});if(r.ownerId!==q.user.id&&r.requesterId!==q.user.id)return s.status(403).json({error:"Only students involved in this transaction can report an issue."});if(!["accepted","completed"].includes(r.status))return s.status(409).json({error:"Issues can be reported only for accepted or completed transactions."});const reason=String(q.body?.reason||"").trim();if(reason.length<8)return s.status(400).json({error:"Please describe the issue in at least 8 characters."});const disputes=read(DF);if(disputes.some(d=>d.requestId===r.id&&d.status!=="resolved"))return s.status(409).json({error:"An open issue already exists for this transaction."});const d={id:uuid(),requestId:r.id,resourceId:r.resourceId,resourceTitle:r.resourceTitle,ownerId:r.ownerId,requesterId:r.requesterId,reportedBy:q.user.id,reportedByName:q.user.fullName,reason:reason.slice(0,1000),status:"open",createdAt:new Date().toISOString()};disputes.push(d);write(DF,disputes);s.status(201).json({message:"Issue reported. It is now recorded for review.",dispute:d})});
+app.get("/api/my-disputes",auth,(q,s)=>{const disputes=read(DF).filter(d=>d.ownerId===q.user.id||d.requesterId===q.user.id).sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));s.json({disputes})});
+app.patch("/api/resources/:id/status",auth,(q,s)=>{let a=read(RF),r=a.find(x=>x.id===q.params.id);if(!r)return s.status(404).json({error:"Resource not found."});if(r.ownerId!==q.user.id)return s.status(403).json({error:"Not your resource."});if(!["available","unavailable"].includes(q.body.status))return s.status(400).json({error:"Invalid status."});r.status=q.body.status;write(RF,a);s.json({resource:r})});
+app.delete("/api/resources/:id",auth,(q,s)=>{let a=read(RF),i=a.findIndex(x=>x.id===q.params.id);if(i<0)return s.status(404).json({error:"Resource not found."});if(a[i].ownerId!==q.user.id)return s.status(403).json({error:"Not your resource."});a.splice(i,1);write(RF,a);s.json({message:"Deleted."})});
+app.get("*",(q,s)=>s.sendFile(path.join(__dirname,"public","index.html")));
+app.listen(PORT,HOST,()=>console.log(`CampusShare running at http://localhost:${PORT}`));
